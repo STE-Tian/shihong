@@ -1,0 +1,274 @@
+"""可选的实时采集：调用本机已安装的 MediaCrawler，只做小规模关键词搜索。
+
+这里不实现签名、验证码、设备指纹或代理池。登录确认由使用者在自己的浏览器里完成。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+from hongsearch.collectors.base import Collection, CollectorError
+from hongsearch.config import ROOT, Settings
+from hongsearch.models import Comment, Item
+from hongsearch.text import crawler_query
+from hongsearch.util import parse_count, parse_timestamp, platform_label
+
+RUNNER_PATH = Path(__file__).with_name("runner.py")
+
+
+def scrub(text: str, secrets: list[str]) -> str:
+    cleaned = text or ""
+    for secret in secrets:
+        if secret and len(secret) >= 6:
+            cleaned = cleaned.replace(secret, "[已隐藏]")
+    return cleaned
+
+
+def parse_output_dir(root: Path, platform: str) -> list[Item]:
+    contents: list[dict] = []
+    comments: list[dict] = []
+    if not root.exists():
+        return []
+    for path in sorted(root.rglob("*")):
+        if path.suffix.lower() not in {".jsonl", ".json"}:
+            continue
+        name = path.name.lower()
+        rows = _load_rows(path)
+        if "comment" in name:
+            comments.extend(rows)
+        elif "content" in name:
+            contents.extend(rows)
+    return _assemble(platform, contents, comments)
+
+
+class MediaCrawlerCollector:
+    mode = "live"
+
+    def __init__(self, settings: Settings, runner=None, sleeper=time.sleep):
+        self.settings = settings
+        self._runner = runner or self._default_run
+        self._sleeper = sleeper
+
+    def collect(self, keywords: list[str], platforms: list[str]) -> Collection:
+        query = crawler_query(keywords)
+        warnings: list[str] = []
+        items: list[Item] = []
+        logs: list[str] = []
+        failures = 0
+        attempts = 0
+        started = False
+        for platform in platforms:
+            if self.settings.login_type == "cookie" and not self.settings.cookie_for(platform):
+                warnings.append(f"未配置{platform_label(platform)} Cookie，已跳过该平台。")
+                continue
+            if started:
+                self._sleeper(self.settings.inter_platform_sleep_sec)
+            started = True
+            attempts += 1
+            try:
+                found, log, warning = self._runner(platform, query)
+            except CollectorError as exc:
+                failures += 1
+                warnings.append(str(exc))
+                continue
+            items.extend(found)
+            if log:
+                logs.append(f"## {platform_label(platform)}\n{log}")
+            if warning:
+                warnings.append(warning)
+        failed = attempts == 0 or (failures == attempts and not items)
+        if attempts == 0 and not any("跳过" in item for item in warnings):
+            warnings.append("没有可检索的平台。")
+        return Collection(
+            items=items,
+            warnings=warnings,
+            logs="\n\n".join(logs)[-4000:],
+            failed=failed,
+        )
+
+    def build_command(self) -> list[str]:
+        return self._python_argv() + [str(RUNNER_PATH)]
+
+    def build_env(self, platform: str, query: str, save_path: Path) -> dict[str, str]:
+        env = os.environ.copy()
+        env.update(
+            {
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
+                "MEDIACRAWLER_HOME": self.settings.mediacrawler_home,
+                "PLATFORM": platform,
+                "KEYWORDS": query,
+                "LOGIN_TYPE": self.settings.login_type,
+                "PLATFORM_COOKIES": self.settings.cookie_for(platform),
+                "SAVE_DATA_PATH": str(save_path),
+                "MAX_NOTES": str(self.settings.max_notes),
+                "MAX_COMMENTS": str(self.settings.max_comments),
+                "SLEEP_SEC": str(int(self.settings.inter_platform_sleep_sec)),
+                "HEADLESS": "true" if self.settings.mediacrawler_headless else "false",
+            }
+        )
+        return env
+
+    def _python_argv(self) -> list[str]:
+        raw = self.settings.mediacrawler_python.strip()
+        if raw:
+            return shlex.split(raw)
+        home = Path(self.settings.mediacrawler_home) if self.settings.mediacrawler_home else None
+        if home is not None:
+            candidate = home / ".venv" / "bin" / "python"
+            if candidate.is_file():
+                return [str(candidate)]
+        return [sys.executable]
+
+    def _secrets(self) -> list[str]:
+        return [self.settings.xhs_cookies, self.settings.dy_cookies, self.settings.llm_api_key]
+
+    def _default_run(self, platform: str, query: str) -> tuple[list[Item], str, str | None]:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_dir = ROOT / "data" / "mediacrawler_runs" / f"{stamp}-{platform}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        command = self.build_command()
+        secret = self.settings.cookie_for(platform)
+        if secret and any(secret in part for part in command):
+            raise CollectorError("已拒绝启动：Cookie 出现在了命令行参数里。")
+        env = self.build_env(platform, query, run_dir)
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=self.settings.mediacrawler_home or None,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=self.settings.crawler_timeout_sec,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CollectorError(
+                f"{platform_label(platform)}采集超时，已停止这次任务。若浏览器还开着，请手动关闭。"
+            ) from exc
+        log = scrub((completed.stdout or "") + "\n" + (completed.stderr or ""), self._secrets())
+        tail = "\n".join(log.strip().splitlines()[-30:])[-2000:]
+        items = parse_output_dir(run_dir, platform)
+        if completed.returncode != 0 and not items:
+            detail = tail[-400:]
+            raise CollectorError(f"{platform_label(platform)}采集失败（退出码 {completed.returncode}）。{detail}")
+        warning = None
+        if completed.returncode != 0:
+            warning = f"{platform_label(platform)}进程退出码为 {completed.returncode}，只读到部分结果。"
+        elif not items:
+            warning = (
+                f"{platform_label(platform)}没有返回内容。可能是登录态失效、关键词过窄，"
+                "或页面要求你本人完成验证。"
+            )
+        return items, tail, warning
+
+
+def _load_rows(path: Path) -> list[dict]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    rows: list[dict] = []
+    if path.suffix.lower() == ".jsonl":
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        return rows
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
+    return []
+
+
+def _assemble(platform: str, contents: list[dict], comments: list[dict]) -> list[Item]:
+    id_field = "note_id" if platform == "xhs" else "aweme_id"
+    grouped: dict[str, list[dict]] = {}
+    for row in comments:
+        key = str(row.get(id_field) or "").strip()
+        if key:
+            grouped.setdefault(key, []).append(row)
+    items: list[Item] = []
+    for row in contents:
+        external_id = str(row.get(id_field) or "").strip()
+        if not external_id:
+            continue
+        parsed_comments: list[Comment] = []
+        for comment in grouped.get(external_id, [])[:10]:
+            text = str(comment.get("content") or "").strip()
+            if not text:
+                continue
+            parsed_comments.append(
+                Comment(
+                    author=_author(comment),
+                    content=text[:300],
+                    like_count=parse_count(comment.get("like_count")),
+                    published_at=parse_timestamp(comment.get("create_time")),
+                )
+            )
+        if platform == "xhs":
+            url = str(row.get("note_url") or "").strip() or f"https://www.xiaohongshu.com/explore/{external_id}"
+            published = parse_timestamp(row.get("time"))
+        else:
+            url = str(row.get("aweme_url") or "").strip() or f"https://www.douyin.com/video/{external_id}"
+            published = parse_timestamp(row.get("create_time"))
+        description = str(row.get("desc") or row.get("content") or "").strip()
+        items.append(
+            Item(
+                platform=platform,
+                external_id=external_id,
+                title=_title(row, description),
+                content=description[:2000],
+                author=_author(row),
+                published_at=published,
+                like_count=parse_count(row.get("liked_count")),
+                collect_count=parse_count(row.get("collected_count")),
+                comment_count=parse_count(row.get("comment_count")),
+                share_count=parse_count(row.get("share_count")),
+                url=url,
+                tags=_tags(row.get("tag_list")),
+                comments=parsed_comments,
+                source_keyword=str(row.get("source_keyword") or "").strip(),
+            )
+        )
+    return items
+
+
+def _author(row: dict) -> str:
+    name = str(row.get("nickname") or "").strip()
+    return name or "未署名"
+
+
+def _title(row: dict, description: str) -> str:
+    title = str(row.get("title") or "").strip()
+    if title:
+        return title[:180]
+    return (description[:40] or "未命名内容")
+
+
+def _tags(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        parts = [str(item).strip() for item in value]
+    else:
+        parts = str(value).replace("，", ",").split(",")
+    return [part for part in (item.strip() for item in parts) if part]

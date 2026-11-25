@@ -1,0 +1,2 @@
+{"note_id": "n1", "title": "五日寿司", "desc": "广州的一家日料店", "time": 1700000000000, "nickname": "周末去吃", "liked_count": "1.2万", "collected_count": "300", "comment_count": "20", "share_count": "3", "note_url": "https://www.xiaohongshu.com/explore/n1", "tag_list": "寿司,广州", "source_keyword": "广州 日料", "user_id": "should-not-leak", "ip_location": "广东"}
+{"note_id": "n2", "title": "", "desc": "只有正文的笔记", "time": "2026-11-01", "nickname": "", "liked_count": 4, "collected_count": 0, "comment_count": 0, "share_count": 0, "note_url": "", "tag_list": ["笔记"], "user_id": "another-secret"}

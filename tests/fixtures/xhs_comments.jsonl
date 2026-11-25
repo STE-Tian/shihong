@@ -1,0 +1,2 @@
+{"note_id": "n1", "content": "要排队", "nickname": "路过", "like_count": 12, "create_time": 1700001000, "user_id": "secret-user"}
+{"note_id": "other", "content": "这条不该挂到 n1", "nickname": "别人", "like_count": 1, "create_time": 1700001000, "user_id": "secret-user"}
