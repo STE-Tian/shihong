@@ -105,6 +105,16 @@ def platform_label(platform: str) -> str:
     return PLATFORM_LABELS.get(platform, platform)
 
 
+def scrub(text: str, secrets: list[str]) -> str:
+    """把已知的 Cookie 和密钥从日志里换成占位符。短字符串不处理，避免误伤普通文本。"""
+
+    cleaned = text or ""
+    for secret in secrets:
+        if secret and len(secret) >= 6:
+            cleaned = cleaned.replace(secret, "[已隐藏]")
+    return cleaned
+
+
 def clamp_int(value: object, default: int, low: int, high: int) -> int:
     try:
         number = int(value)  # type: ignore[arg-type]
