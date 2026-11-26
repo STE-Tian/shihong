@@ -59,6 +59,7 @@ def _clamp(raw: str, default: int, low: int, high: int) -> int:
 
 def main() -> None:
     home = os.environ["MEDIACRAWLER_HOME"]
+    print("拾红：正在启动 MediaCrawler", flush=True)
     os.chdir(home)
     sys.path.insert(0, home)
     secret = os.environ.get("PLATFORM_COOKIES", "")

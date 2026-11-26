@@ -10,7 +10,7 @@ class Recorder:
 
     mode = "demo"
 
-    def collect(self, keywords, platforms):
+    def collect(self, keywords, platforms, progress=None):
         self.calls += 1
         return Collection(items=[])
 

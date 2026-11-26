@@ -79,6 +79,8 @@ def test_parent_command_and_scrub(tmp_path):
     env = collector.build_env("xhs", "广州 日料店", tmp_path)
     assert env["PLATFORM_COOKIES"] == secret
     assert env["KEYWORDS"] == "广州 日料店"
+    assert env["PYTHONUNBUFFERED"] == "1"
+    assert command[3] == "-u"
     assert scrub(f"失败 {secret}", [secret]) == "失败 [已隐藏]"
 
 

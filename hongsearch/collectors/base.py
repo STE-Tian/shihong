@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from hongsearch.models import Item
+from hongsearch.progress import Progress
 
 
 class CollectorError(RuntimeError):
@@ -23,5 +24,10 @@ class Collection:
 class Collector(Protocol):
     mode: str
 
-    def collect(self, keywords: list[str], platforms: list[str]) -> Collection:
+    def collect(
+        self,
+        keywords: list[str],
+        platforms: list[str],
+        progress: Progress | None = None,
+    ) -> Collection:
         """返回候选内容。排序和时间过滤由检索服务负责。"""

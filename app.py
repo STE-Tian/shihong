@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 
-from hongsearch.analysis import analyze
-from hongsearch.collectors import build_collector
 from hongsearch.config import ENV_PATH, load_settings, reload_settings, resolve_runtime_mode
 from hongsearch.db import Database
-from hongsearch.llm import LLMClient, LLMError
+from hongsearch.jobs import discard_job, get_job, start_analysis_job, start_search_job
 from hongsearch.models import ResultItem, SavedAnalysis, SearchOutcome
-from hongsearch.service import SearchService
 from hongsearch.util import format_count, platform_label, snippet
 
 st.set_page_config(page_title="拾红", page_icon="📕", layout="wide")
@@ -91,14 +89,22 @@ def open_database(path_str: str) -> Database:
 
 def use_example(text: str) -> None:
     st.session_state.query = text
+    if st.session_state.get("search_job_id"):
+        st.session_state.search_notice = "上一次检索还在进行。可以先取消，再开始新的。"
+        return
     st.session_state.pending_search = True
 
 
 def mark_search() -> None:
+    if st.session_state.get("search_job_id"):
+        st.session_state.search_notice = "上一次检索还在进行。可以先取消，再开始新的。"
+        return
     st.session_state.pending_search = True
 
 
 def mark_analysis() -> None:
+    if st.session_state.get("search_job_id") or st.session_state.get("analysis_job_id"):
+        return
     st.session_state.pending_analysis = True
 
 
@@ -130,6 +136,9 @@ def init_state() -> None:
     st.session_state.setdefault("outcome", None)
     st.session_state.setdefault("analysis", None)
     st.session_state.setdefault("analysis_error", None)
+    st.session_state.setdefault("search_job_id", None)
+    st.session_state.setdefault("analysis_job_id", None)
+    st.session_state.setdefault("search_notice", None)
 
 
 def consume_history(database: Database) -> None:
@@ -149,45 +158,168 @@ def consume_history(database: Database) -> None:
     st.session_state.time_choice = choice_from_time(outcome.time_range)
 
 
-def run_search(database: Database) -> None:
-    settings = load_settings()
+def format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"已进行 {total} 秒"
+    minutes, rest = divmod(total, 60)
+    return f"已进行 {minutes} 分 {rest} 秒"
+
+
+def mount_panel(func, *, active: bool, key: str) -> None:
+    # 有任务时每秒重画这一小块。整页脚本不能停在采集过程上，否则按钮会全部失效。
+    panel = st.fragment(run_every=1 if active else None, key=key)(func)
+    panel()
+
+
+def _start_search(database: Database, settings) -> None:
+    if st.session_state.get("search_job_id"):
+        st.session_state.search_notice = "上一次检索还在进行。可以先取消，再开始新的。"
+        return
     mode, _reason = resolve_runtime_mode(settings, MODE_CHOICES[st.session_state.mode_choice])
-    service = SearchService(settings, database, build_collector(mode, settings))
-    outcome = service.search(
+    st.session_state.search_job_id = start_search_job(
+        settings,
+        database,
+        mode,
         st.session_state.query,
         PLATFORM_CHOICES[st.session_state.platform_choice],
         TIME_CHOICES[st.session_state.time_choice],
         bool(st.session_state.force_refresh),
     )
+
+
+def _start_analysis(database: Database, settings) -> None:
+    if st.session_state.get("analysis_job_id") or st.session_state.get("search_job_id"):
+        return
+    outcome: SearchOutcome | None = st.session_state.get("outcome")
+    if outcome is None:
+        return
+    st.session_state.analysis_error = None
+    st.session_state.analysis_job_id = start_analysis_job(settings, database, outcome)
+
+
+def _consume_finished_search() -> bool:
+    job_id = st.session_state.get("search_job_id")
+    job = get_job(job_id)
+    if job is None:
+        if job_id:
+            st.session_state.search_job_id = None
+        return False
+    if not job.finished.is_set():
+        return False
+    with job.lock:
+        if job.adopted:
+            return False
+        job.adopted = True
+        outcome = job.outcome
+    if outcome is None:
+        outcome = SearchOutcome(
+            search_id=None,
+            query=st.session_state.get("query", ""),
+            keywords=[],
+            platforms=[],
+            time_range="all",
+            mode="",
+            items=[],
+            warnings=[],
+            error="检索没有返回结果。",
+        )
+    st.session_state.search_job_id = None
     st.session_state.outcome = outcome
     st.session_state.analysis = None
     st.session_state.analysis_error = None
+    discard_job(job_id)
+    return True
 
 
-def run_analysis(database: Database) -> None:
-    st.session_state.analysis_error = None
-    outcome: SearchOutcome | None = st.session_state.get("outcome")
-    if outcome is None or outcome.error or not outcome.items:
-        st.session_state.analysis_error = "先检索出内容，再做深度分析。"
+def _consume_finished_analysis() -> bool:
+    job_id = st.session_state.get("analysis_job_id")
+    job = get_job(job_id)
+    if job is None:
+        if job_id:
+            st.session_state.analysis_job_id = None
+        return False
+    if not job.finished.is_set():
+        return False
+    with job.lock:
+        if job.adopted:
+            return False
+        job.adopted = True
+        analysis = job.analysis
+        error = job.analysis_error
+        anchor_id = job.anchor_search_id
+        anchor_query = job.anchor_query
+    st.session_state.analysis_job_id = None
+    discard_job(job_id)
+    current: SearchOutcome | None = st.session_state.get("outcome")
+    if current is None or current.search_id != anchor_id or current.query != anchor_query:
+        return True
+    st.session_state.analysis = analysis
+    st.session_state.analysis_error = error
+    return True
+
+
+def search_activity_panel() -> None:
+    if _consume_finished_search():
+        st.rerun(scope="app")
+    job = get_job(st.session_state.get("search_job_id"))
+    if job is None or job.finished.is_set():
         return
-    settings = load_settings()
-    client = LLMClient(settings.llm_base_url, settings.llm_api_key, settings.llm_model)
-    try:
-        result = analyze(outcome.query, outcome.items, client)
-    except LLMError as exc:
-        st.session_state.analysis_error = str(exc)
-        result = analyze(outcome.query, outcome.items, None)
-        result.report = f"> 大模型没有生成报告，下面改为摘录。原因：{exc}\n\n" + result.report
-    st.session_state.analysis = SavedAnalysis(
-        kind=result.kind,
-        model=result.model,
-        report=result.report,
-        created_at="",
-    )
-    if outcome.search_id:
-        st.session_state.analysis = database.save_analysis(
-            outcome.search_id, result.kind, result.model, result.report
-        )
+    _render_search_progress(job)
+
+
+def analysis_activity_panel() -> None:
+    if _consume_finished_analysis():
+        st.rerun(scope="app")
+    job = get_job(st.session_state.get("analysis_job_id"))
+    if job is None or job.finished.is_set():
+        return
+    _render_analysis_progress(job)
+
+
+def _render_search_progress(job) -> None:
+    steps = job.progress.snapshot()
+    elapsed = format_elapsed(time.monotonic() - job.progress.started_at)
+    current = next((step for step in reversed(steps) if step.state in {"waiting", "running", "error"}), None)
+    if current is None and steps:
+        current = steps[-1]
+    if current is not None and current.state == "waiting":
+        title = f"需要你处理：{current.label}"
+    elif current is not None:
+        title = current.label
+    else:
+        title = "检索进行中"
+    with st.status(f"{title} · {elapsed}", expanded=True):
+        st.caption("检索在后台进行，页面上的其他按钮仍然可以点。这次仍使用开始时的平台和时间，完成后会更新主栏里的结果。")
+        for step in steps:
+            prefix = {"done": "完成", "waiting": "等待你", "error": "失败", "running": "进行中"}.get(
+                step.state, step.state
+            )
+            st.markdown(f"**{prefix}** · {step.label}")
+            if not step.detail:
+                continue
+            if step.state == "waiting":
+                st.warning(step.detail)
+            elif step.state == "error":
+                st.error(step.detail)
+            else:
+                st.caption(step.detail)
+        if st.button("取消检索", key="cancel-search"):
+            job.progress.request_cancel()
+
+
+def _render_analysis_progress(job) -> None:
+    steps = job.progress.snapshot()
+    elapsed = format_elapsed(time.monotonic() - job.progress.started_at)
+    current = next((step for step in reversed(steps) if step.state in {"running", "error"}), None)
+    title = current.label if current is not None else "深度分析"
+    with st.status(f"{title} · {elapsed}", expanded=True):
+        st.caption("分析在后台进行，不会挡住检索进度和页面上的其他按钮。")
+        for step in steps:
+            prefix = {"done": "完成", "error": "失败", "running": "进行中"}.get(step.state, step.state)
+            st.markdown(f"**{prefix}** · {step.label}")
+            if step.detail:
+                st.caption(step.detail)
 
 
 def badge(platform: str) -> str:
@@ -209,6 +341,8 @@ def render_sidebar(database: Database, settings) -> None:
         st.caption("小红书 Cookie：" + ("已填写" if settings.xhs_cookies else "未填写"))
         st.caption("抖音 Cookie：" + ("已填写" if settings.dy_cookies else "未填写"))
         st.caption(f"MediaCrawler：{settings.mediacrawler_home or '未设置'}")
+        if st.session_state.get("search_job_id"):
+            st.caption("检索在后台进行。主栏能看到步骤，也可以取消。历史和筛选仍然可以点。")
         if st.button("重新加载 .env", width="stretch"):
             load_dotenv(ENV_PATH, override=True)
             reload_settings()
@@ -273,7 +407,10 @@ def render_result(index: int, result: ResultItem, demo: bool) -> None:
 
 def render_outcome(outcome: SearchOutcome) -> None:
     if outcome.error:
-        st.error(outcome.error)
+        if outcome.error.startswith("检索已取消"):
+            st.warning(outcome.error)
+        else:
+            st.error(outcome.error)
     for warning in outcome.warnings:
         st.warning(warning)
     if outcome.logs:
@@ -301,8 +438,14 @@ def render_outcome(outcome: SearchOutcome) -> None:
 
 def render_analysis(outcome: SearchOutcome | None) -> None:
     st.markdown("### 深度分析")
+    mount_panel(
+        analysis_activity_panel,
+        active=bool(st.session_state.get("analysis_job_id")),
+        key="analysis-activity",
+    )
     st.caption("只把当前列表里的标题、正文摘录和评论交给模型，并要求用 [编号] 回到这些条目。不会上传 Cookie。")
-    disabled = outcome is None or bool(outcome.error) or not outcome.items
+    busy = bool(st.session_state.get("search_job_id") or st.session_state.get("analysis_job_id"))
+    disabled = busy or outcome is None or bool(outcome.error) or not outcome.items
     st.button("生成深度分析", type="primary", disabled=disabled, on_click=mark_analysis)
     if st.session_state.get("analysis_error"):
         st.error(st.session_state.analysis_error)
@@ -327,13 +470,13 @@ def main() -> None:
     init_state()
     settings = load_settings()
     database = open_database(str(settings.database_path))
+    _consume_finished_search()
+    _consume_finished_analysis()
     consume_history(database)
     if st.session_state.pop("pending_search", False):
-        with st.spinner("正在检索…"):
-            run_search(database)
+        _start_search(database, settings)
     if st.session_state.pop("pending_analysis", False):
-        with st.spinner("正在整理分析…"):
-            run_analysis(database)
+        _start_analysis(database, settings)
     render_sidebar(database, settings)
 
     st.markdown("# 拾红")
@@ -364,13 +507,24 @@ def main() -> None:
     st.text_input("问题或关键词", key="query", placeholder="例如：广州有哪些值得推荐的日料店？")
     st.radio("平台", list(PLATFORM_CHOICES), key="platform_choice", horizontal=True)
     st.radio("时间", list(TIME_CHOICES), key="time_choice", horizontal=True)
-    st.button("检索", type="primary", on_click=mark_search, width="stretch")
+    searching = bool(st.session_state.get("search_job_id"))
+    st.button(
+        "检索进行中" if searching else "检索",
+        type="primary",
+        on_click=mark_search,
+        disabled=searching,
+        width="stretch",
+    )
     st.checkbox("忽略缓存，重新检索", key="force_refresh")
+    notice = st.session_state.pop("search_notice", None)
+    if notice:
+        st.info(notice)
+    mount_panel(search_activity_panel, active=searching, key="search-activity")
 
     outcome: SearchOutcome | None = st.session_state.get("outcome")
-    if outcome is None:
+    if outcome is None and not searching:
         st.info("输入一个具体问题后再检索。没有 Cookie 和大模型密钥时，也可以先用上面的例子看演示结果。")
-    else:
+    elif outcome is not None:
         render_outcome(outcome)
 
     render_analysis(outcome)

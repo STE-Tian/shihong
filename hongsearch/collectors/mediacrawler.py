@@ -8,27 +8,25 @@ from __future__ import annotations
 import json
 import os
 import shlex
-import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 from hongsearch.collectors.base import Collection, CollectorError
+from hongsearch.collectors.live_run import (
+    decide_run_outcome,
+    read_cdp_connect_existing,
+    read_cdp_port,
+    run_process,
+)
 from hongsearch.config import ROOT, Settings
 from hongsearch.models import Comment, Item
+from hongsearch.progress import Progress
 from hongsearch.text import crawler_query
-from hongsearch.util import parse_count, parse_timestamp, platform_label
+from hongsearch.util import parse_count, parse_timestamp, platform_label, scrub
 
 RUNNER_PATH = Path(__file__).with_name("runner.py")
-
-
-def scrub(text: str, secrets: list[str]) -> str:
-    cleaned = text or ""
-    for secret in secrets:
-        if secret and len(secret) >= 6:
-            cleaned = cleaned.replace(secret, "[已隐藏]")
-    return cleaned
 
 
 def parse_output_dir(root: Path, platform: str) -> list[Item]:
@@ -55,9 +53,23 @@ class MediaCrawlerCollector:
         self.settings = settings
         self._runner = runner or self._default_run
         self._sleeper = sleeper
+        self._progress = Progress()
 
-    def collect(self, keywords: list[str], platforms: list[str]) -> Collection:
+    def collect(
+        self,
+        keywords: list[str],
+        platforms: list[str],
+        progress: Progress | None = None,
+    ) -> Collection:
         query = crawler_query(keywords)
+        previous = self._progress
+        self._progress = progress or Progress()
+        try:
+            return self._collect(query, platforms)
+        finally:
+            self._progress = previous
+
+    def _collect(self, query: str, platforms: list[str]) -> Collection:
         warnings: list[str] = []
         items: list[Item] = []
         logs: list[str] = []
@@ -65,26 +77,47 @@ class MediaCrawlerCollector:
         attempts = 0
         started = False
         for platform in platforms:
+            if self._progress.cancelled:
+                warnings.append("检索已取消，不再打开下一个平台。")
+                break
             if self.settings.login_type == "cookie" and not self.settings.cookie_for(platform):
                 warnings.append(f"未配置{platform_label(platform)} Cookie，已跳过该平台。")
                 continue
             if started:
-                self._sleeper(self.settings.inter_platform_sleep_sec)
+                seconds = self.settings.inter_platform_sleep_sec
+                self._progress.step(
+                    "pause",
+                    "平台之间停一下",
+                    "running",
+                    f"停 {seconds:.0f} 秒，避免连续打开下一个平台。",
+                )
+                try:
+                    self._pause(seconds)
+                except CollectorError as exc:
+                    warnings.append(str(exc))
+                    break
+                self._progress.step("pause", "平台之间停一下", "done", f"已停 {seconds:.0f} 秒。")
             started = True
             attempts += 1
+            label = platform_label(platform)
+            self._progress.step(f"{platform}-boot", f"启动{label}采集", "running", "正在启动 MediaCrawler。")
             try:
                 found, log, warning = self._runner(platform, query)
             except CollectorError as exc:
                 failures += 1
                 warnings.append(str(exc))
+                if self._progress.cancelled:
+                    break
                 continue
             items.extend(found)
             if log:
-                logs.append(f"## {platform_label(platform)}\n{log}")
+                logs.append(f"## {label}\n{log}")
             if warning:
                 warnings.append(warning)
+            if self._progress.cancelled:
+                break
         failed = attempts == 0 or (failures == attempts and not items)
-        if attempts == 0 and not any("跳过" in item for item in warnings):
+        if attempts == 0 and not any("跳过" in item or "已取消" in item for item in warnings):
             warnings.append("没有可检索的平台。")
         return Collection(
             items=items,
@@ -93,8 +126,27 @@ class MediaCrawlerCollector:
             failed=failed,
         )
 
+    def _pause(self, seconds: float) -> None:
+        if self._sleeper is not time.sleep:
+            self._sleeper(seconds)
+            if self._progress.cancelled:
+                raise CollectorError("检索已取消。")
+            return
+        deadline = time.monotonic() + seconds
+        while True:
+            if self._progress.cancelled:
+                raise CollectorError("检索已取消。")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.2, remaining))
+
     def build_command(self) -> list[str]:
-        return self._python_argv() + [str(RUNNER_PATH)]
+        argv = self._python_argv()
+        script = str(RUNNER_PATH)
+        if argv and "python" in Path(argv[-1]).name.lower():
+            return [*argv, "-u", script]
+        return [*argv, script]
 
     def build_env(self, platform: str, query: str, save_path: Path) -> dict[str, str]:
         env = os.environ.copy()
@@ -102,6 +154,7 @@ class MediaCrawlerCollector:
             {
                 "PYTHONIOENCODING": "utf-8",
                 "PYTHONUTF8": "1",
+                "PYTHONUNBUFFERED": "1",
                 "MEDIACRAWLER_HOME": self.settings.mediacrawler_home,
                 "PLATFORM": platform,
                 "KEYWORDS": query,
@@ -139,35 +192,58 @@ class MediaCrawlerCollector:
         if secret and any(secret in part for part in command):
             raise CollectorError("已拒绝启动：Cookie 出现在了命令行参数里。")
         env = self.build_env(platform, query, run_dir)
+        label = platform_label(platform)
         try:
-            completed = subprocess.run(
-                command,
+            result = run_process(
+                command=command,
                 cwd=self.settings.mediacrawler_home or None,
                 env=env,
-                capture_output=True,
-                text=True,
-                timeout=self.settings.crawler_timeout_sec,
-                check=False,
+                run_dir=run_dir,
+                platform=platform,
+                login_type=self.settings.login_type,
+                timeout_sec=self.settings.crawler_timeout_sec,
+                progress=self._progress,
+                secrets=self._secrets(),
+                cdp_port=read_cdp_port(self.settings.mediacrawler_home),
+                connect_existing=read_cdp_connect_existing(self.settings.mediacrawler_home),
             )
-        except subprocess.TimeoutExpired as exc:
-            raise CollectorError(
-                f"{platform_label(platform)}采集超时，已停止这次任务。若浏览器还开着，请手动关闭。"
-            ) from exc
-        log = scrub((completed.stdout or "") + "\n" + (completed.stderr or ""), self._secrets())
-        tail = "\n".join(log.strip().splitlines()[-30:])[-2000:]
+        except CollectorError:
+            raise
+        except Exception as exc:
+            items = parse_output_dir(run_dir, platform)
+            detail = scrub(str(exc), self._secrets())[:200]
+            if items:
+                self._mark_saved(platform, len(items))
+                return items, "", f"{label}采集中断（{detail}），保留已经写好的 {len(items)} 条公开内容。"
+            raise CollectorError(f"{label}采集失败：{detail}") from exc
         items = parse_output_dir(run_dir, platform)
-        if completed.returncode != 0 and not items:
-            detail = tail[-400:]
-            raise CollectorError(f"{platform_label(platform)}采集失败（退出码 {completed.returncode}）。{detail}")
-        warning = None
-        if completed.returncode != 0:
-            warning = f"{platform_label(platform)}进程退出码为 {completed.returncode}，只读到部分结果。"
-        elif not items:
-            warning = (
-                f"{platform_label(platform)}没有返回内容。可能是登录态失效、关键词过窄，"
-                "或页面要求你本人完成验证。"
+        try:
+            items, log, warning = decide_run_outcome(
+                items,
+                result,
+                platform,
+                self.settings.crawler_timeout_sec,
+                self._secrets(),
             )
-        return items, tail, warning
+        except CollectorError as exc:
+            self._progress.step(f"{platform}-result", f"{label}采集", "error", str(exc))
+            raise
+        self._mark_saved(platform, len(items))
+        return items, log, warning
+
+    def _mark_saved(self, platform: str, count: int) -> None:
+        label = platform_label(platform)
+        if count:
+            self._progress.step(f"{platform}-notes", f"获取{label}笔记", "done", f"读到 {count} 条。")
+        if self._progress.has(f"{platform}-comments"):
+            self._progress.step(f"{platform}-comments", f"获取{label}评论", "done", "这一轮写入的评论已读回。")
+        if self._progress.has(f"{platform}-cdp"):
+            current = next(
+                (step for step in self._progress.snapshot() if step.key == f"{platform}-cdp"),
+                None,
+            )
+            if current is not None and current.state in {"running", "waiting"}:
+                self._progress.step(f"{platform}-cdp", "连接 Chrome 远程调试", "done", "这一轮已结束。")
 
 
 def _load_rows(path: Path) -> list[dict]:
